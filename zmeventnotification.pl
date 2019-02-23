@@ -41,7 +41,9 @@ use Time::HiRes qw/gettimeofday/;
 use Symbol qw(qualify_to_ref);
 use IO::Select;
 
-#use Data::Dump qw(dump);
+# debugging only
+#use Data::Dumper;
+
 # ==========================================================================
 #
 # Starting v1.0, configuration has moved to a separate file, please make sure
@@ -56,7 +58,7 @@ use IO::Select;
 # ==========================================================================
 
 
-my $app_version="2.6";
+my $app_version="3.1";
 
 # ==========================================================================
 #
@@ -87,8 +89,10 @@ use constant {
     DEFAULT_CUSTOMIZE_READ_ALARM_CAUSE              => 0,
     DEFAULT_CUSTOMIZE_TAG_ALARM_EVENT_ID            => 0,
     DEFAULT_CUSTOMIZE_USE_CUSTOM_NOTIFICATION_SOUND => 0,
-    DEFAULT_CUSTOMIZE_USE_HOOK_DESCRIPTION          => 0,
-    DEFAULT_CUSTOMIZE_INCLUDE_PICTURE               => 0
+    DEFAULT_CUSTOMIZE_INCLUDE_PICTURE               => 0,
+    DEFAULT_HOOK_KEEP_FRAME_MATCH_TYPE              => 1,
+    DEFAULT_HOOK_USE_HOOK_DESCRIPTION               => 0,
+    DEFAULT_HOOK_STORE_FRAME_IN_ZM                  => 0,
 };
 
 
@@ -145,6 +149,9 @@ my $use_custom_notification_sound;
 
 my $hook;
 my $use_hook_description;
+my $keep_frame_match_type;
+my $skip_monitors;
+my $store_frame_in_zm;
 
 my $picture_url;
 my $include_picture;
@@ -156,7 +163,6 @@ use constant NINJA_API_KEY => "AAAApYcZ0mA:APA91bG71SfBuYIaWHJorjmBQB3cAN7OMT7bA
 my $dummyEventTest = 0; # if on, will generate dummy events. Not in config for a reason. Only dev testing
 my $dummyEventInterval = 20; # timespan to generate events in seconds
 my $dummyEventTimeLastSent = time();
-my $keepBestMatchId = 0; # keep [a] [s] -> useful to know which frame matched, but only for geeks
 
 
 # This part makes sure we have the right core deps. See later for optional deps
@@ -216,9 +222,14 @@ Usage: zmeventnotification.pl [OPTION]...
   --use-custom-notification-sound     Use custom notification sound (default: true).
   --no-use-custom-notification-sound  Don't use custom notification sound (default: false).
 
-  --hook=FILE                         Intercept events before they are reported to do custom processing.
+  --hook-script=FILE                  Intercept events before they are reported to do custom processing.
   --use-hook-description              Overwrite alarm text with content returned by hook script (default: true).
   --no-use-hook-description           Do not overwrite alarm text with content returned by hook script (default: false).
+
+  --keep-frame-match-type             Retain identify of matched frame ([a]larm, [s]napshot, [x])
+  --no-keep-frame-match-type          Do not retain identity of matched frame
+
+  --skip-monitors=LIST                Comma separated list of monitors that will be skipped for hooks
 
 
   --include-picture                   Add alarm frame image in notification (only for Android) (default: false).
@@ -258,8 +269,11 @@ GetOptions(
   "tag-alarm-event-id!"            => \$tag_alarm_event_id,
   "use-custom-notification-sound!" => \$use_custom_notification_sound,
 
-  "hook=s"                         => \$hook,
+  "hook-script=s"                  => \$hook,
   "use-hook-description!"          => \$use_hook_description,
+  "keep-frame-match-type!"         => \$keep_frame_match_type,
+  "store_frame_in_zm!"             => \$store_frame_in_zm,
+  "skip-monitors=s"                => \$skip_monitors,
 
   "picture-url=s"                  => \$picture_url,
   "include-picture!"               => \$include_picture
@@ -327,12 +341,17 @@ $monitor_reload_interval       //= config_get_val($config, "customize", "monitor
 $read_alarm_cause              //= config_get_val($config, "customize", "read_alarm_cause", DEFAULT_CUSTOMIZE_READ_ALARM_CAUSE);
 $tag_alarm_event_id            //= config_get_val($config, "customize", "tag_alarm_event_id", DEFAULT_CUSTOMIZE_TAG_ALARM_EVENT_ID);
 $use_custom_notification_sound //= config_get_val($config, "customize", "use_custom_notification_sound",DEFAULT_CUSTOMIZE_USE_CUSTOM_NOTIFICATION_SOUND);
-
-$hook                         //= config_get_val($config, "customize", "hook");
-$use_hook_description         //= config_get_val($config, "customize", "use_hook_description", DEFAULT_CUSTOMIZE_USE_HOOK_DESCRIPTION);
-
 $picture_url                 //= config_get_val($config, "customize", "picture_url");
 $include_picture             //= config_get_val($config, "customize", "include_picture", DEFAULT_CUSTOMIZE_INCLUDE_PICTURE);
+
+
+$hook                         //= config_get_val($config, "hook", "hook_script");
+$use_hook_description         //= config_get_val($config, "hook", "use_hook_description", DEFAULT_HOOK_USE_HOOK_DESCRIPTION);
+$keep_frame_match_type        //= config_get_val($config, "hook", "keep_frame_match_type", DEFAULT_HOOK_KEEP_FRAME_MATCH_TYPE);
+$skip_monitors                //= config_get_val($config, "hook", "skip_monitors");
+$store_frame_in_zm            //= config_get_val($config, "hook", "store_frame_in_zm");
+
+
 my %ssl_push_opts = ();
 
 if ($ssl_enabled && (!$ssl_cert_file || !$ssl_key_file)) {
@@ -402,6 +421,10 @@ Use custom notification sound . ${\(true_or_false($use_custom_notification_sound
 
 Hook .......................... ${\(value_or_undefined($hook))}
 Use Hook Description........... ${\(true_or_false($use_hook_description))}
+Keep frame match type.......... ${\(true_or_false($keep_frame_match_type))}
+Skipped monitors............... ${\(value_or_undefined($skip_monitors))}
+Store Frame in ZM...............${\(true_or_false($store_frame_in_zm))}
+
 
 Picture URL ................... ${\(value_or_undefined($picture_url))}
 Include picture................ ${\(true_or_false($include_picture))}
@@ -842,7 +865,8 @@ sub deleteFCMToken
                        intlist => $intlist,
                        last_sent=>{},
                        platform => $platform,
-                       pushstate => $pushstate
+                       pushstate => $pushstate,
+                       extra_fields=>''
                       };
         
     }
@@ -859,7 +883,7 @@ sub sendOverMQTTBroker
     my $json;
 
     # only remove if not removed before. If you are sending over multiple channels, it may have already been stripped
-    $alarm->{Cause} = substr ($alarm->{Cause},4) if (!$keepBestMatchId && $alarm->{Cause} =~ /^\[.\]/);
+    $alarm->{Cause} = substr ($alarm->{Cause},4) if (!$keep_frame_match_type && $alarm->{Cause} =~ /^\[.\]/);
     my $description = $alarm->{Name}.":(".$alarm->{EventId}.") ".$alarm->{Cause};
 
     $json = encode_json ({
@@ -883,7 +907,7 @@ sub sendOverWebSocket {
     my $alarm = shift; 
     my $ac = shift;
     # only remove if not removed before. If you are sending over multiple channels, it may have already been stripped
-    $alarm->{Cause} = substr ($alarm->{Cause},4) if (!$keepBestMatchId && $alarm->{Cause} =~ /^\[.\]/);
+    $alarm->{Cause} = substr ($alarm->{Cause},4) if (!$keep_frame_match_type && $alarm->{Cause} =~ /^\[.\]/);
     my $str = encode_json({event => 'alarm', type=>'', status=>'Success', events => [$alarm]});
      printDebug ("Child: posting job to send out message to id:".$ac->{id}."->".$ac->{conn}->ip().":".$ac->{conn}->port());
     print WRITER "message--TYPE--".$ac->{id}."--SPLIT--".$str."\n";
@@ -907,17 +931,17 @@ sub sendOverFCM
         my $npic = $pic =~ s/BESTMATCH/alarm/gr;
         $pic = $npic;        
         printDebug ("Alarm frame matched, changing picture url to:$pic ");
-        $alarm->{Cause} = substr ($alarm->{Cause},4) if (!$keepBestMatchId);
+        $alarm->{Cause} = substr ($alarm->{Cause},4) if (!$keep_frame_match_type);
     }
     
     elsif ( substr($alarm->{Cause},0,3) eq "[s]" ) {
         my $npic = $pic =~ s/BESTMATCH/snapshot/gr;
         $pic = $npic;        
         printDebug ("Alarm frame matched, changing picture url to:$pic ");
-        $alarm->{Cause} = substr ($alarm->{Cause},4) if (!$keepBestMatchId);
+        $alarm->{Cause} = substr ($alarm->{Cause},4) if (!$keep_frame_match_type);
     }
     elsif ( substr($alarm->{Cause},0,3) eq "[x]" ) {
-        $alarm->{Cause} = substr ($alarm->{Cause},4) if (!$keepBestMatchId);
+        $alarm->{Cause} = substr ($alarm->{Cause},4) if (!$keep_frame_match_type);
     }
     
     my $now = strftime('%I:%M %p, %d-%b',localtime);
@@ -1132,6 +1156,21 @@ sub processJobs
 }
 
 
+# returns extra fields associated to a connection
+sub getConnFields {
+    my $conn = shift;
+    my $matched = "";
+    foreach (@active_connections) {
+        if (exists $_->{conn} && $_->{conn} == $conn) {
+            $matched = $_->{extra_fields};
+            $matched = ' [' . $matched . '] ' if $matched;
+            last;
+            
+        }
+    }
+    return $matched;
+}
+
 # This runs at each tick to purge connections
 # that are inactive or have had an error
 # This also closes any connection that has not provided
@@ -1151,7 +1190,7 @@ sub checkConnection
                 if (exists $_->{conn})
                 {
                     my $conn = $_->{conn};
-                    printInfo ("Rejecting ".$conn->ip()." - authentication timeout");
+                    printInfo ("Rejecting ".$conn->ip().getConnFields($conn)." - authentication timeout");
                     $_->{state} = PENDING_DELETE;
                     my $str = encode_json({event => 'auth', type=>'',status=>'Fail', reason => 'NOAUTH'});
                     eval {$_->{conn}->send_utf8($str);};
@@ -1477,7 +1516,8 @@ sub initMQTT {
         monlist => "",
         intlist => "",
         last_sent=>{},
-	mqtt_conn=>$mqtt_connection,
+        extra_fields=>'',
+	    mqtt_conn=>$mqtt_connection,
     };
 }
 
@@ -1518,6 +1558,7 @@ sub initFCMTokens
                intlist => $intlist,
                last_sent=>{},
                platform => $platform,
+               extra_fields=>'',
                pushstate => $pushstate
               };
         
@@ -1801,23 +1842,40 @@ sub processAlarms {
     foreach (@events) {
         my $alarm = $_;
         printInfo ("processAlarms: EID:".$alarm->{EventId}." Monitor:".$alarm->{Name}." (id):".$alarm->{MonitorId}." cause:".$alarm->{Cause});
+
         # if you want to use hook, lets first call the hook
         # if the hook returns an exit value of 0 (yes/success), we process it, else we skip it
+        
         if ($hook) {
-            my $cmd = $hook." ".$alarm->{EventId}." ".$alarm->{MonitorId}." \"".$alarm->{Name}."\"";
-            printInfo ("Invoking hook:".$cmd);
-            my $resTxt = `$cmd`;
-            my $resCode = $? >> 8;
-            chomp($resTxt);
-            printInfo("hook script returned with text:".$resTxt." exit:".$resCode);
-            next if ($resCode !=0);
-            if ($use_hook_description) {
-              
-                $alarm->{Cause} = $resTxt;
-                # This updated the ZM DB with the detected description
-                print WRITER "event_description--TYPE--".$alarm->{MonitorId}."--SPLIT--".$alarm->{EventId}."--SPLIT--".$resTxt."\n";
+            if ($skip_monitors && isInList($skip_monitors, $alarm->{MonitorId})) {
+                printInfo ("Skipping hook processing because ".$alarm->{Name}."(".$alarm->{MonitorId}.") is in skip monitor list");
             }
-            
+            else {
+                my $cmd = $hook." ".$alarm->{EventId}." ".$alarm->{MonitorId}." \"".$alarm->{Name}."\""." \"".$alarm->{Cause}."\"";
+                # new ZM 1.33 feature - lets me extract event path so I can store the hook detection image
+                if ($store_frame_in_zm) {
+                    if (!try_use ("ZoneMinder::Event")) {
+                        Error ("ZoneMinder::Event missing, you may be using an old version");
+                    } else {
+                        my $event = new ZoneMinder::Event($alarm->{EventId});
+                        $cmd = $cmd." \"".$event->Path()."\"";
+                        printInfo ("Adding event path:".$event->Path()." to hook for image storage");
+                    }
+                    
+                }
+                printInfo ("Invoking hook:".$cmd);
+                my $resTxt = `$cmd`;
+                my $resCode = $? >> 8;
+                chomp($resTxt);
+                printInfo("hook script returned with text:".$resTxt." exit:".$resCode);
+                next if ($resCode !=0);
+                if ($use_hook_description) {
+                  
+                    $alarm->{Cause} = $resTxt;
+                    # This updated the ZM DB with the detected description
+                    print WRITER "event_description--TYPE--".$alarm->{MonitorId}."--SPLIT--".$alarm->{EventId}."--SPLIT--".$resTxt."\n";
+                }
+           } 
         }
         # coming here means the alarm needs to be sent out to listerens who are interested
         printInfo ("Matching alarm to connection rules...");
@@ -1901,6 +1959,7 @@ sub initSocketServer
             printDebug("---------->onConnect START<--------------");
             my ($len) = scalar @active_connections;
             printInfo ("got a websocket connection from ".$conn->ip()." (". $len.") active connections");
+             #print Dumper($conn);
             $conn->on(
                 utf8 => sub {
                     printDebug("---------->onConnect msg START<--------------");
@@ -1912,8 +1971,18 @@ sub initSocketServer
                 handshake => sub {
                     my ($conn, $handshake) = @_;
                     printDebug("---------->onConnect:handshake START<--------------");
+                    my $fields="";
+
+                    # Stuff in more headers you want here over time
+                    if ($handshake->req->fields ) {
+                           my $f = $handshake->req->fields;
+                           #print Dumper($f);
+                           $fields = $fields." X-Forwarded-For:".$f->{"x-forwarded-for"} if $f->{"x-forwarded-for"};
+                           #$fields = $fields." host:".$f->{"host"} if $f->{"host"};
+                            
+                    }
+                    #print Dumper($handshake);
                     my $id = gettimeofday;
-                    printInfo ("Websockets: New Connection Handshake requested from ".$conn->ip().":".$conn->port()." state=pending auth, id=".$id);
                     my $connect_time = time();
                     push @active_connections, {
                                    type => WEB,
@@ -1926,15 +1995,17 @@ sub initSocketServer
                                    last_sent=>{},
                                    platform => "websocket",
                                    pushstate => '',
+                                   extra_fields=> $fields,
                                    badge => 0};
-                   
+                    printInfo ("Websockets: New Connection Handshake requested from ".$conn->ip().":".$conn->port().getConnFields($conn)." state=pending auth, id=".$id);
+                                      
                 printDebug("---------->onConnect:handshake END<--------------");
                 },
                 disconnect => sub
                 {
                     my ($conn, $code, $reason) = @_;
                     printDebug("---------->onConnect:disconnect START<--------------");
-                    printInfo ("Websocket remotely disconnected from ".$conn->ip());
+                    printInfo ("Websocket remotely disconnected from ".$conn->ip().getConnFields($conn));
                     foreach (@active_connections)
                     {
                         if ((exists $_->{conn}) && ($_->{conn}->ip() eq $conn->ip())  &&
@@ -1945,12 +2016,13 @@ sub initSocketServer
                             if ( $_->{token} eq '')
                             {
                                 $_->{state}=PENDING_DELETE;
-                                printInfo( "Marking ".$conn->ip()." for deletion as websocket closed remotely\n");
+                                printInfo( "Marking ".$conn->ip().getConnFields($conn)." for deletion as websocket closed remotely\n");
                             }
                             else
                             {
                                 
-                                printInfo( "Invaliding websocket, but NOT Marking ".$conn->ip()." for deletion as token ".$_->{token}." active\n");
+                                printInfo( "Invaliding websocket, but NOT Marking ".$conn->ip().getConnFields
+($conn)." for deletion as token ".$_->{token}." active\n");
                                 $_->{state}=INVALID_CONNECTION;
                             }
                         }

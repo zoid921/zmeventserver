@@ -1,4 +1,4 @@
-**Latest Version: 2.6**
+**Latest Version: 3.1**
 
 <!-- TOC -->
 
@@ -9,7 +9,7 @@
 - [Why do we need it?](#why-do-we-need-it)
 - [Is this officially developed by ZM developers?](#is-this-officially-developed-by-zm-developers)
 - [How do I install it?](#how-do-i-install-it)
-    - [Download the server script and its config file](#download-the-server-script-and-its-config-file)
+    - [Download the repo](#download-the-repo)
     - [Install Dependencies](#install-dependencies)
     - [SSL certificate (Generate new, or use ZoneMinder certs if you are already using HTTPS)](#ssl-certificate-generate-new-or-use-zoneminder-certs-if-you-are-already-using-https)
         - [IOS Users](#ios-users)
@@ -20,7 +20,7 @@
 - [How do I safely upgrade zmeventserver to new versions?](#how-do-i-safely-upgrade-zmeventserver-to-new-versions)
 - [Configuring the notification server](#configuring-the-notification-server)
     - [Understanding zmeventnotification configuration](#understanding-zmeventnotification-configuration)
-    - [What is the hook attribute ?](#what-is-the-hook-attribute-)
+    - [What is the hook section ?](#what-is-the-hook-section-)
 - [Troubleshooting common situations](#troubleshooting-common-situations)
     - [Picture notifications don't show images](#picture-notifications-dont-show-images)
     - [Secure mode just doesn't work (WSS) - WS works](#secure-mode-just-doesnt-work-wss---ws-works)
@@ -59,7 +59,7 @@ If you are installing `zmeventnotification` for the first time, just read the [H
 
 ## Machine Learning! Mmm..Machine Learning!
 
-Easy. You will first have to read this document to correctly install this server along with zoneminder. Once it works well, you can explore how to enable Machine Learning based object detection that can be used along with ZoneMinder alarms. If you already have this server figured out, you can skip directly to the machine learning part [here](https://github.com/pliablepixels/zmeventserver/blob/master/hook_example/README.md)
+Easy. You will first have to read this document to correctly install this server along with zoneminder. Once it works well, you can explore how to enable Machine Learning based object detection that can be used along with ZoneMinder alarms. If you already have this server figured out, you can skip directly to the machine learning part [here](https://github.com/pliablepixels/zmeventserver/blob/master/hook/README.md)
 
 ## What is it?
 
@@ -80,7 +80,7 @@ No. I developed it for zmNinja, but you can use it with your own consumer.
 
 ## How do I install it?
 
-### Download the server script and its config file
+### Download the repo
 
 - Clone the project to some directory `git clone https://github.com/pliablepixels/zmeventserver.git`
 - Edit `zmeventnotification.ini` to your liking. More details about various parts of the configuration are explained later in this readme
@@ -178,7 +178,7 @@ key = /etc/apache2/ssl/zoneminder.key
 
 #### IOS Users
 
-Starting IOS 10.2, I noticed that zmNinja was not able to register with the event server when it was using WSS (SSL enabled) and self-signed certificates. To solve this, I had to email myself the zoneminder certificate (`zoneminder.crt`) file and install it in the phone. Why that is needed only for WSS and not for HTTPS is a mystery to me. The alternative is to run the eventserver in WS mode by disabling SSL.
+On some IOS devices and when using self signed certs, I noticed that zmNinja was not able to register with the event server when it was using WSS (SSL enabled) and self-signed certificates. To solve this, I had to email myself the zoneminder certificate (`zoneminder.crt`) file and install it in the phone. Why that is needed only for WSS and not for HTTPS is a mystery to me. The alternative is to run the eventserver in WS mode by disabling SSL.
 
 ### Making sure everything is running (in manual mode)
 
@@ -190,11 +190,10 @@ Starting IOS 10.2, I noticed that zmNinja was not able to register with the even
 
 ### Running it as a daemon so it starts automatically along with ZoneMinder
 
-- Move `zmeventnotification.pl` to `/usr/bin` (or `/usr/local/bin` or whichever directory your other ZM perl scripts are installed).
-- Move `zmeventnotification.ini` to `/etc`
-- If you are using hook scripts, move the hook scripts to the path you specified in your ini file. Make sure they are executable.
+- You can now move the ES to the right place by simply doing `./sudo install.sh` and following prompts. Other options are below:
+- Execute `sudo ./install.sh --no-install-hook` to move the ES to the right place without installing machine learning hooks 
+- In ZM 1.32.0 and above, go to your web interface, and go to `Options->Systems` and enable `OPT_USE_EVENTNOTIFICATION` and you are all set.
 
-**NOTE** : Starting version 1.32.0 of ZoneMinder, you now have an option to directly enable this daemon as an option directly in the settings of Options->Systems. Just enable "OPT_USE_EVENTNOTIFICATION" and you are all set.
 **The rest of this section is NOT NEEDED for 1.32.0 and above!**
 
 **WARNING** : Do NOT do this before you run it manually as I've mentioned above to test. Make sure it works, all packages are present etc. before you
@@ -286,25 +285,34 @@ Hook .......................... '/usr/bin/person_detect_wrapper.sh'
 Use Hook Description........... true
 ```
 
-### What is the hook attribute ?
+### What is the hook section ?
 
-The `hook` attribute allows you to invoke a custom script when an alarm is triggered by ZM. 
+The `hook` section allows you to invoke a custom script when an alarm is triggered by ZM. 
+
+`hook_script` points to the script that is invoked when an alarm occurs
+
 If the script returns success (exit value of 0) then the notification server will send out an alarm notification. If not, it will not send a notification to 
 its listeners. This is useful to implement any custom logic you may want to perform that decides whether this event is worth sending a notification for.
 
 Related to `hook` we also have a `hook_description` attribute. When set to 1, the text returned by the hook script will overwrite the alarm text that is notified.
 
+We also have a `skip_monitors` attribute. This is a comma separated list of monitors. When alarms occur in those monitors, hooks will not be called and the ES will
+directly send out notifications (if enabled in ES). This is useful when you don't want to invoke hooks for certain monitors as they may be expensive 
+(especially if you are doing object detection)
+
+Finally, `keep_frame_match_type` is really used when you enable "bestmatch". It prefixes an `[a]` or `[s]` to tell you if object detection succeeded in the alarmed or snapshot frame.
+
 Here is an example:
 (Note: just an example, please don't ask me for support for person detection)
 
-- You will find a sample `detect_wrapper.sh` hook in the `hook_example` directory. This script is invoked by the notification server when an event occurs.
+- You will find a sample `detect_wrapper.sh` hook in the `hook` directory. This script is invoked by the notification server when an event occurs.
 - This script in turn invokes a python OpenCV based script that grabs an image with maximum score from the current event so far and runs a fast person detection routine.
 - It returns the value "person detected" if a person is found and none if not
 - The wrapper script then checks for this value and exits with either 0 (send alarm) or 1 (don't send alarm)
 - the notification server then sends out a "<Monitor Name>: person detected" notification to the clients listening
 
 Those who want to know more:
-- Read the detailed notes [here](https://github.com/pliablepixels/zmeventserver/tree/master/hook_example)
+- Read the detailed notes [here](https://github.com/pliablepixels/zmeventserver/tree/master/hook)
 - Read [this](https://medium.com/zmninja/inside-the-hood-machine-learning-enhanced-real-time-alarms-with-zoneminder-e26c34fe354c) for an explanation of how this works
 
 ## Troubleshooting common situations
@@ -314,9 +322,10 @@ Those who want to know more:
 ### Picture notifications don't show images
 
 Starting v2.0, I support images in alarms. However, there are several conditions to be met:
-* Works only on Android for now
 * You can't use self signed certs
+* The IP/hostname needs to be publicly accessible (Apple/Google servers render the image)
 * You need patches to ZM unless you are using a package that is later than Oct 11, 2018. Please read the notes in the INI file 
+* A good way to isolate if its a URL problem or something else is replace the `picture_url` with a knows HTTPS url like [this](https://upload.wikimedia.org/wikipedia/commons/5/5f/Chinese_new_year_dragon_2014.jpg)
 
 ### Secure mode just doesn't work (WSS) - WS works
 
